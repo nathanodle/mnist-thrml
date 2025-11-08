@@ -59,3 +59,29 @@ uv run python verbose_eval.py \
 - Set `JAX_PLATFORM_NAME=cpu` (already defaulted in `train_mnist_thrml.py`) to avoid GPU wheel confusion.
 - TFDS will download MNIST to `~/tensorflow_datasets/` on first run; reuse with `--data-dir` if needed.
 - When running on production-sized MNIST, expect ~40 minutes per epoch on a CPU-only Mac. Reduce `--n_hidden`, use `--max-train-samples`, or lower sampler steps for quick iteration.
+
+## Example training run output
+
+```
+$ uv run python train_mnist_thrml.py        --checkpoint-dir checkpoints/full_run        --save-params checkpoints/final.npz
+Training with 468 batches/epoch, batch size 128, n_hidden 256
+epoch 1: mean proxy loss 0.257767
+Saved checkpoint to checkpoints/full_run/params_epoch0001.npz
+epoch 2: mean proxy loss 0.107676
+Saved checkpoint to checkpoints/full_run/params_epoch0002.npz
+epoch 3: mean proxy loss 0.102537
+Saved checkpoint to checkpoints/full_run/params_epoch0003.npz
+epoch 4: mean proxy loss 0.098284
+Saved checkpoint to checkpoints/full_run/params_epoch0004.npz
+epoch 5: mean proxy loss 0.098853
+Saved checkpoint to checkpoints/full_run/params_epoch0005.npz
+Training complete
+free-energy surrogate (train subset): -1852.1560
+free-energy surrogate (test subset):  -1851.2820
+classification accuracy (train subset, 1000 samples): 43.10%
+classification accuracy (test subset, 1000 samples):  43.90%
+Saved parameters to checkpoints/final.npz
+Runtime: 267.84 minutes
+```
+
+
