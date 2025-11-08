@@ -56,7 +56,8 @@ uv run python verbose_eval.py \
 ```
 
 ## Tips
-- Set `JAX_PLATFORM_NAME=cpu` (already defaulted in `train_mnist_thrml.py`) to avoid GPU wheel confusion.
+- Set `JAX_PLATFORMS=cuda,cpu` (defaulted in the training scripts) so JAX prefers GPU when available but still falls back to CPU.
+- If CUDA wheels (e.g., `nvidia-cusparse-cu12`) are installed via pip, the training scripts auto-append their `lib/` directories to `LD_LIBRARY_PATH` so you can run without exporting it manually.
 - TFDS will download MNIST to `~/tensorflow_datasets/` on first run; reuse with `--data-dir` if needed.
 - When running on production-sized MNIST, expect ~40 minutes per epoch on a CPU-only Mac. Reduce `--n_hidden`, use `--max-train-samples`, or lower sampler steps for quick iteration.
 
@@ -83,5 +84,3 @@ classification accuracy (test subset, 1000 samples):  43.90%
 Saved parameters to checkpoints/final.npz
 Runtime: 267.84 minutes
 ```
-
-

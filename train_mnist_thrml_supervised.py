@@ -1,5 +1,13 @@
 #!/usr/bin/env python
-"""Train an Ising-style EBM on MNIST using THRML with block Gibbs sampling."""
+"""Train an Ising-style EBM on MNIST using THRML with clamped (conditional) training.
+
+- Positive phase: clamp pixels (always) and, if label spins are enabled, clamp labels; sample hidden.
+- Negative phase: clamp pixels; sample labels (if any) and hidden.
+
+When --use-label-spins=false, this reduces to the original joint training where the
+visible block is clamped in the positive phase and both vis+hid are sampled in the
+negative phase.
+"""
 
 import argparse
 import os
@@ -25,17 +33,19 @@ from tqdm import trange
 
 from thrml.block_management import Block
 from thrml.block_sampling import SamplingSchedule
-from thrml.models.ising import IsingEBM, IsingTrainingSpec, estimate_kl_grad, hinton_init
+from thrml.models.ising import IsingEBM, IsingTrainingSpec, estimate_kl_grad, estimate_moments, hinton_init
 from thrml.pgm import SpinNode
 
 Array = jnp.ndarray
 
+# Compatibility for older THRML versions expecting jax.tree.flatten_with_path
 if not hasattr(jax.tree, "flatten_with_path"):
-    # THRML <=0.1.3 expects the old helper on jax.tree
     jax.tree.flatten_with_path = jax.tree_util.tree_flatten_with_path  # type: ignore[attr-defined]
 
 
-def load_mnist(data_dir: str | None, threshold: float) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]:
+def load_mnist(
+    data_dir: str | None, threshold: float
+) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]:
     """Load MNIST splits from TFDS, normalize to [0, 1], then map to spins in {-1, +1}."""
     builder_kwargs = dict(as_supervised=True, batch_size=-1)
     if data_dir is not None:
@@ -68,7 +78,9 @@ def append_label_spins(features: np.ndarray, labels: np.ndarray, n_classes: int)
     return np.concatenate([features, label_spins], axis=1)
 
 
-def make_batches(rng: np.random.Generator, xs: np.ndarray, ys: np.ndarray, batch_size: int, drop_last: bool = True) -> Iterable[Tuple[np.ndarray, np.ndarray]]:
+def make_batches(
+    rng: np.random.Generator, xs: np.ndarray, ys: np.ndarray, batch_size: int, drop_last: bool = True
+) -> Iterable[Tuple[np.ndarray, np.ndarray]]:
     """Yield shuffled mini-batches with optional remainder drop to keep shapes static."""
     idx = rng.permutation(xs.shape[0])
     if drop_last:
@@ -81,7 +93,21 @@ def make_batches(rng: np.random.Generator, xs: np.ndarray, ys: np.ndarray, batch
         yield xs[sl], ys[sl]
 
 
-def build_model(n_vis: int, n_hid: int, beta: float) -> tuple:
+def build_model(
+    n_vis: int,
+    n_hid: int,
+    beta: float,
+    *,
+    use_label_spins: bool,
+    n_pixels: int,
+    n_classes: int,
+):
+    """Build Ising model and return useful blocks for clamped training.
+
+    Returns:
+        model, nodes, edges,
+        block_vis_all, block_pixels, block_labels, block_hid
+    """
     vis_nodes = [SpinNode() for _ in range(n_vis)]
     hid_nodes = [SpinNode() for _ in range(n_hid)]
     nodes = vis_nodes + hid_nodes
@@ -94,22 +120,130 @@ def build_model(n_vis: int, n_hid: int, beta: float) -> tuple:
 
     model = IsingEBM(nodes, edges, biases, weights, beta_arr)
 
-    block_vis = Block(vis_nodes)
+    # Blocks
+    block_vis_all = Block(vis_nodes)
     block_hid = Block(hid_nodes)
 
-    return model, nodes, edges, block_vis, block_hid
+    if use_label_spins:
+        pixels_nodes = vis_nodes[:n_pixels]
+        labels_nodes = vis_nodes[n_pixels : n_pixels + n_classes]
+        block_pixels = Block(pixels_nodes)
+        block_labels = Block(labels_nodes)
+    else:
+        # No label spins present; treat all visibles as "pixels"
+        block_pixels = block_vis_all
+        block_labels = None
+
+    return model, nodes, edges, block_vis_all, block_pixels, block_labels, block_hid
 
 
-def make_training_spec(model: IsingEBM, block_vis: Block, block_hid: Block, schedule_pos: SamplingSchedule, schedule_neg: SamplingSchedule) -> IsingTrainingSpec:
+def make_training_spec(
+    model: IsingEBM,
+    *,
+    block_pixels: Block,
+    block_labels: Block | None,
+    block_hid: Block,
+    schedule_pos: SamplingSchedule,
+    schedule_neg: SamplingSchedule,
+    use_label_spins: bool,
+) -> IsingTrainingSpec:
+    """Configure clamped training.
+
+    - Positive: clamp pixels and (if enabled) labels; sample hidden.
+    - Negative: clamp pixels; sample labels (if any) and hidden.
+
+    Implementation detail:
+    * Put PIXELS in conditioning_blocks  -> clamped in BOTH phases.
+    * Put LABELS in data_blocks          -> clamped ONLY in the POSITIVE phase.
+    """
+    if use_label_spins and block_labels is not None:
+        data_blocks = [block_labels]                 # labels clamped only in positive
+        conditioning_blocks = [block_pixels]         # pixels clamped in both phases
+        positive_sampling_blocks = [block_hid]       # hidden free (+)
+        negative_sampling_blocks = [block_labels, block_hid]  # labels+hidden free (-)
+    else:
+        # No label spins
+        data_blocks = [block_pixels]
+        conditioning_blocks = []
+        positive_sampling_blocks = [block_hid]
+        negative_sampling_blocks = [block_pixels, block_hid]  # joint negative
+
     return IsingTrainingSpec(
         model,
-        data_blocks=[block_vis],
-        conditioning_blocks=[],
-        positive_sampling_blocks=[block_hid],
-        negative_sampling_blocks=[block_vis, block_hid],
+        data_blocks=data_blocks,
+        conditioning_blocks=conditioning_blocks,
+        positive_sampling_blocks=positive_sampling_blocks,
+        negative_sampling_blocks=negative_sampling_blocks,
         schedule_positive=schedule_pos,
         schedule_negative=schedule_neg,
     )
+
+
+def estimate_kl_grad_conditioned(
+    key: Array,
+    training_spec: IsingTrainingSpec,
+    bias_nodes: list[SpinNode],
+    weight_edges: list[tuple[SpinNode, SpinNode]],
+    data: list[Array],
+    conditioning_values: list[Array],
+    init_state_positive: list[Array],
+    init_state_negative: list[Array],
+) -> tuple:
+    """Variant of THRML's estimator that supports per-sample conditioning data."""
+
+    if not conditioning_values:
+        raise ValueError("conditioning_values must be provided for conditioned training.")
+
+    key_pos, key_neg = random.split(key, 2)
+
+    clamped_pos_tree = tuple(data + conditioning_values)
+    keys_pos = random.split(key_pos, init_state_positive[0].shape[:2])
+
+    def _run_pos_chain(k_chain: Array, init_chain: list[Array]) -> tuple[Array, Array]:
+        return jax.vmap(
+            lambda k_sample, init_sample, clamped_sample: estimate_moments(
+                k_sample,
+                bias_nodes,
+                weight_edges,
+                training_spec.program_positive,
+                training_spec.schedule_positive,
+                init_sample,
+                list(clamped_sample),
+            )
+        )(k_chain, init_chain, clamped_pos_tree)
+
+    moms_b_pos, moms_w_pos = jax.vmap(_run_pos_chain)(keys_pos, init_state_positive)
+
+    cond_tree = tuple(conditioning_values)
+    keys_neg = random.split(key_neg, init_state_negative[0].shape[:2])
+
+    def _run_neg_chain(k_chain: Array, init_chain: list[Array]) -> tuple[Array, Array]:
+        return jax.vmap(
+            lambda k_sample, init_sample, cond_sample: estimate_moments(
+                k_sample,
+                bias_nodes,
+                weight_edges,
+                training_spec.program_negative,
+                training_spec.schedule_negative,
+                init_sample,
+                list(cond_sample),
+            )
+        )(k_chain, init_chain, cond_tree)
+
+    moms_b_neg, moms_w_neg = jax.vmap(_run_neg_chain)(keys_neg, init_state_negative)
+
+    float_type = training_spec.ebm.beta.dtype
+
+    def _mean_except_last(x: Array) -> Array:
+        axes = tuple(range(max(x.ndim - 1, 0)))
+        if not axes:
+            return x
+        return jnp.mean(x, axis=axes, dtype=float_type)
+
+    grad_b = -training_spec.ebm.beta * (_mean_except_last(moms_b_pos) - _mean_except_last(moms_b_neg))
+    grad_w = -training_spec.ebm.beta * (_mean_except_last(moms_w_pos) - _mean_except_last(moms_w_neg))
+
+    return grad_w, grad_b, (moms_b_pos, moms_w_pos), (moms_b_neg, moms_w_neg)
 
 
 @partial(jax.jit, static_argnums=(3,))
@@ -166,7 +300,6 @@ def predict_labels(
     n_classes: int,
 ) -> Array:
     """Classify digits by scanning label spin states and picking the lowest free energy."""
-
     label_options = jnp.eye(n_classes, dtype=pixel_spins.dtype) * 2.0 - 1.0
 
     def classify_single(sample: Array) -> Array:
@@ -228,10 +361,34 @@ def run_training(args: argparse.Namespace) -> None:
     n_vis = x_train.shape[1]
     checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else None
 
-    model, nodes, edges, block_vis, block_hid = build_model(n_vis, args.n_hidden, args.beta)
+    (
+        model,
+        nodes,
+        edges,
+        _block_vis_all,
+        block_pixels,
+        block_labels,
+        block_hid,
+    ) = build_model(
+        n_vis,
+        args.n_hidden,
+        args.beta,
+        use_label_spins=args.use_label_spins,
+        n_pixels=n_pixels,
+        n_classes=args.n_classes,
+    )
 
+    # Positive: sample hidden only; Negative: sample labels (if any) + hidden.
     schedule = SamplingSchedule(args.n_warmup, args.n_samples, args.steps_per_sample)
-    training_spec = make_training_spec(model, block_vis, block_hid, schedule, schedule)
+    training_spec = make_training_spec(
+        model,
+        block_pixels=block_pixels,
+        block_labels=block_labels,
+        block_hid=block_hid,
+        schedule_pos=schedule,
+        schedule_neg=schedule,
+        use_label_spins=args.use_label_spins,
+    )
 
     params = (model.weights, model.biases)
     opt_state = adam_init_like(params)
@@ -246,33 +403,68 @@ def run_training(args: argparse.Namespace) -> None:
         model = eqx.tree_at(lambda m: m.weights, model, load_w)
         model = eqx.tree_at(lambda m: m.biases, model, load_b)
         model = eqx.tree_at(lambda m: m.beta, model, load_beta)
-        training_spec = make_training_spec(model, block_vis, block_hid, schedule, schedule)
+        training_spec = make_training_spec(
+            model,
+            block_pixels=block_pixels,
+            block_labels=block_labels,
+            block_hid=block_hid,
+            schedule_pos=schedule,
+            schedule_neg=schedule,
+            use_label_spins=args.use_label_spins,
+        )
 
     n_batches = max(1, x_train.shape[0] // args.batch_size)
-    print(f"Training with {n_batches} batches/epoch, batch size {args.batch_size}, n_hidden {args.n_hidden}")
+    print(
+        f"Training with {n_batches} batches/epoch, batch size {args.batch_size}, "
+        f"n_hidden {args.n_hidden}, label_spins={args.use_label_spins}"
+    )
 
     for epoch in range(1, args.epochs + 1):
         epoch_losses = []
         iterator = make_batches(rng, x_train, y_train, args.batch_size, drop_last=True)
         pbar = trange(n_batches, desc=f"epoch {epoch}", leave=False)
-        for step_idx, (xb, _) in enumerate(iterator):
-            xb_bool = jnp.array(xb > 0, dtype=jnp.bool_)
+        for step_idx, (xb, _yb) in enumerate(iterator):
+            xb = jnp.array(xb)
+
+            if args.use_label_spins:
+                # Slice out pixels and label spins from concatenated visibles
+                xb_pixels = xb[:, :n_pixels]
+                xb_labels = xb[:, n_pixels : n_pixels + args.n_classes]
+
+                # Boolean clamps
+                pixels_bool = jnp.array(xb_pixels > 0, dtype=jnp.bool_)
+                labels_bool = jnp.array(xb_labels > 0, dtype=jnp.bool_)
+
+                pos_shape = (args.n_pos_chains, xb.shape[0])  # (chains, batch)
+                neg_shape = (args.n_neg_chains, xb.shape[0])  # (chains, batch)
+
+                data_list = [labels_bool]
+                cond_list = [pixels_bool]
+            else:
+                # No label spins: clamp all visibles in positive; joint negative
+                vis_bool = jnp.array(xb > 0, dtype=jnp.bool_)
+                data_list = [vis_bool]
+                cond_list = []
+                pos_shape = (args.n_pos_chains, xb.shape[0])
+                neg_shape = (args.n_neg_chains,)
 
             key, k_pos_init, k_neg_init, k_grad = random.split(key, 4)
 
-            pos_shape = (args.n_pos_chains, xb_bool.shape[0])
-            neg_shape = (args.n_neg_chains,)
+            init_pos = hinton_init(
+                k_pos_init, model, training_spec.program_positive.gibbs_spec.free_blocks, pos_shape
+            )
+            init_neg = hinton_init(
+                k_neg_init, model, training_spec.program_negative.gibbs_spec.free_blocks, neg_shape
+            )
 
-            init_pos = hinton_init(k_pos_init, model, training_spec.program_positive.gibbs_spec.free_blocks, pos_shape)
-            init_neg = hinton_init(k_neg_init, model, training_spec.program_negative.gibbs_spec.free_blocks, neg_shape)
-
-            grad_w, grad_b, (moms_b_pos, moms_w_pos), (moms_b_neg, moms_w_neg) = estimate_kl_grad(
+            grad_fn = estimate_kl_grad_conditioned if cond_list else estimate_kl_grad
+            grad_w, grad_b, (moms_b_pos, moms_w_pos), (moms_b_neg, moms_w_neg) = grad_fn(
                 k_grad,
                 training_spec,
                 nodes,
                 edges,
-                data=[xb_bool],
-                conditioning_values=[],
+                data=data_list,
+                conditioning_values=cond_list,
                 init_state_positive=init_pos,
                 init_state_negative=init_neg,
             )
@@ -281,15 +473,25 @@ def run_training(args: argparse.Namespace) -> None:
             params, opt_state = adam_step(params, grads, opt_state, lr=args.lr)
             model = eqx.tree_at(lambda m: m.weights, model, params[0])
             model = eqx.tree_at(lambda m: m.biases, model, params[1])
-            training_spec = make_training_spec(model, block_vis, block_hid, schedule, schedule)
 
+            # Rebuild spec with updated model tree (keeps schedules, blocks the same)
+            training_spec = make_training_spec(
+                model,
+                block_pixels=block_pixels,
+                block_labels=block_labels,
+                block_hid=block_hid,
+                schedule_pos=schedule,
+                schedule_neg=schedule,
+                use_label_spins=args.use_label_spins,
+            )
+
+            # Lightweight proxy to track progress; not the actual likelihood.
             pos_nodes_mean = jnp.mean(moms_b_pos, axis=(0, 1))
             neg_nodes_mean = jnp.mean(moms_b_neg, axis=0)
             pos_edges_mean = jnp.mean(moms_w_pos, axis=(0, 1))
             neg_edges_mean = jnp.mean(moms_w_neg, axis=0)
-            loss_proxy = (
-                jnp.mean((pos_nodes_mean - neg_nodes_mean) ** 2)
-                + jnp.mean((pos_edges_mean - neg_edges_mean) ** 2)
+            loss_proxy = jnp.mean((pos_nodes_mean - neg_nodes_mean) ** 2) + jnp.mean(
+                (pos_edges_mean - neg_edges_mean) ** 2
             )
             epoch_losses.append(float(loss_proxy))
 
@@ -331,7 +533,7 @@ def run_training(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="MNIST Ising EBM demo with THRML")
+    parser = argparse.ArgumentParser(description="MNIST Ising EBM demo with THRML (clamped training)")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--n-hidden", type=int, default=256)
@@ -353,7 +555,7 @@ def parse_args() -> argparse.Namespace:
         "--use-label-spins",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Augment visible spins with one-hot label spins so accuracy can be evaluated.",
+        help="Augment visible spins with one-hot label spins and use conditional negative phase (pixels clamped).",
     )
     parser.add_argument(
         "--checkpoint-dir",
