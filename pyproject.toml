@@ -1,0 +1,18 @@
+[project]
+name = "mnist-thrml"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "jax>=0.4.30",
+  "jaxlib>=0.4.30",
+  "thrml>=0.1.0",
+  "tensorflow-cpu>=2.16 ; platform_system == \"Linux\"",
+  "tensorflow-macos>=2.16 ; platform_system == \"Darwin\"",
+  "tensorflow-datasets>=4.9.5",
+  "numpy>=1.26",
+  "matplotlib>=3.8",
+  "tqdm>=4.66",
+]
+
+[tool.uv]
+cache-dir = ".uv-cache"
